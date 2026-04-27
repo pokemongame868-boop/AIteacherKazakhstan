@@ -1,0 +1,2375 @@
+# app.py - AI QAZAQ Teachers Platform
+import streamlit as st
+import sqlite3
+import pandas as pd
+from datetime import datetime, timedelta
+import hashlib
+import random
+import json
+import os
+import io
+import base64
+import string
+import time
+import matplotlib.pyplot as plt
+import numpy as np
+
+try:
+    import plotly.graph_objects as go
+    import plotly.express as px
+    PLOTLY_AVAILABLE = True
+except:
+    PLOTLY_AVAILABLE = False
+
+# ============ ДЕРЕКҚОР БАЗАСЫ ============
+def init_db():
+    """Дерекқорды бастапқы жасау"""
+    conn = sqlite3.connect('ai_qazaq_teachers.db')
+    c = conn.cursor()
+    
+    # Мұғалімдер кестесі
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS teachers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL,
+            email TEXT,
+            full_name TEXT,
+            school TEXT,
+            city TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # Сыныптар кестесі
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS classes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            teacher_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            subject TEXT,
+            grade_level TEXT,
+            description TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (teacher_id) REFERENCES teachers (id)
+        )
+    ''')
+    
+    # Оқушылар кестесі - academic_performance бағанасын қосу
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS students (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            class_id INTEGER NOT NULL,
+            full_name TEXT NOT NULL,
+            student_code TEXT UNIQUE,
+            grade_points INTEGER DEFAULT 0,
+            academic_performance TEXT DEFAULT 'Орташа',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (class_id) REFERENCES classes (id)
+        )
+    ''')
+    
+    # academic_performance бағанасын тексеру және қосу
+    c.execute("PRAGMA table_info(students)")
+    columns = [column[1] for column in c.fetchall()]
+    
+    if 'academic_performance' not in columns:
+        c.execute('''
+            ALTER TABLE students 
+            ADD COLUMN academic_performance TEXT DEFAULT 'Орташа'
+        ''')
+    
+    # Оқушы логиндері
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS student_logins (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            student_id INTEGER NOT NULL,
+            username TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (student_id) REFERENCES students (id)
+        )
+    ''')
+    
+    # БЖБ тапсырмалары
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS bzb_tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            teacher_id INTEGER NOT NULL,
+            class_id INTEGER NOT NULL,
+            task_name TEXT NOT NULL,
+            task_file BLOB,
+            file_type TEXT,
+            upload_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            completion_rate INTEGER DEFAULT 0,
+            difficulty_level TEXT,
+            ai_solution TEXT,
+            FOREIGN KEY (teacher_id) REFERENCES teachers (id),
+            FOREIGN KEY (class_id) REFERENCES classes (id)
+        )
+    ''')
+    
+    # Көрнекіліктер
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS visual_materials (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            teacher_id INTEGER NOT NULL,
+            file_name TEXT NOT NULL,
+            file_data BLOB,
+            file_type TEXT,
+            file_size INTEGER,
+            category TEXT,
+            upload_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (teacher_id) REFERENCES teachers (id)
+        )
+    ''')
+    
+    # Сабақ жоспарлары
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS lesson_plans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            teacher_id INTEGER NOT NULL,
+            class_id INTEGER NOT NULL,
+            lesson_name TEXT NOT NULL,
+            subject TEXT,
+            grade_level TEXT,
+            lesson_type TEXT,
+            duration_minutes INTEGER DEFAULT 40,
+            goals TEXT,
+            methods TEXT,
+            equipment TEXT,
+            stages TEXT,
+            reflection TEXT,
+            ai_suggestions TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (teacher_id) REFERENCES teachers (id),
+            FOREIGN KEY (class_id) REFERENCES classes (id)
+        )
+    ''')
+    
+    # Оқушыларға тапсырмалар
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS student_tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            teacher_id INTEGER NOT NULL,
+            student_id INTEGER NOT NULL,
+            class_id INTEGER NOT NULL,
+            task_name TEXT NOT NULL,
+            task_description TEXT,
+            task_file BLOB,
+            file_type TEXT,
+            due_date TIMESTAMP,
+            status TEXT DEFAULT 'Жіберілмеді',
+            points INTEGER DEFAULT 0,
+            feedback TEXT,
+            assigned_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            completed_date TIMESTAMP,
+            FOREIGN KEY (teacher_id) REFERENCES teachers (id),
+            FOREIGN KEY (student_id) REFERENCES students (id),
+            FOREIGN KEY (class_id) REFERENCES classes (id)
+        )
+    ''')
+    
+    conn.commit()
+    conn.close()
+    print("✅ Дерекқор сәтті бастапқыланды!")
+
+# ============ СЕССИЯ БАСҚАРУ ============
+USER_SESSION_FILE = "user_session.json"
+STUDENT_SESSION_FILE = "student_session.json"
+
+def save_user_session(user):
+    with open(USER_SESSION_FILE, "w", encoding="utf-8") as f:
+        json.dump({
+            "id": user[0],
+            "username": user[1],
+            "full_name": user[2],
+            "school": user[3],
+            "city": user[4]
+        }, f, ensure_ascii=False)
+
+def load_user_session():
+    if os.path.exists(USER_SESSION_FILE):
+        try:
+            with open(USER_SESSION_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return (data["id"], data["username"], data["full_name"], data["school"], data["city"])
+        except:
+            return None
+    return None
+
+def save_student_session(student):
+    with open(STUDENT_SESSION_FILE, "w", encoding="utf-8") as f:
+        json.dump({
+            "id": student[0],
+            "full_name": student[1],
+            "student_code": student[2],
+            "class_id": student[3],
+            "class_name": student[4],
+            "subject": student[5],
+            "grade_points": student[6],
+            "academic_performance": student[7] if len(student) > 7 else "Орташа"
+        }, f, ensure_ascii=False)
+
+def load_student_session():
+    if os.path.exists(STUDENT_SESSION_FILE):
+        try:
+            with open(STUDENT_SESSION_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return (data["id"], data["full_name"], data["student_code"], 
+                    data["class_id"], data["class_name"], data["subject"],
+                    data["grade_points"], data["academic_performance"])
+        except:
+            return None
+    return None
+
+def clear_user_session():
+    if os.path.exists(USER_SESSION_FILE):
+        os.remove(USER_SESSION_FILE)
+
+def clear_student_session():
+    if os.path.exists(STUDENT_SESSION_FILE):
+        os.remove(STUDENT_SESSION_FILE)
+
+# ============ ОРТАҚ ФУНКЦИЯЛАР ============
+def hash_password(password):
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def generate_random_password(length=8):
+    characters = string.ascii_letters + string.digits
+    return ''.join(random.choice(characters) for _ in range(length))
+
+def get_file_extension(file_type):
+    if '/' in file_type:
+        return file_type.split('/')[-1]
+    return 'file'
+
+def points_to_grade(points):
+    try:
+        if isinstance(points, str):
+            points = points.strip()
+            if points == '':
+                return "F"
+            try:
+                points_int = int(float(points))
+            except:
+                return "F"
+        elif isinstance(points, (int, float)):
+            points_int = int(points)
+        else:
+            return "F"
+        
+        if points_int >= 9: return "A"
+        elif points_int >= 7: return "B"
+        elif points_int >= 5: return "C"
+        elif points_int >= 3: return "D"
+        else: return "F"
+    except:
+        return "F"
+
+def get_grade_class(grade):
+    grade_classes = {
+        "A": "grade-a", "B": "grade-b", "C": "grade-c",
+        "D": "grade-d", "F": "grade-f"
+    }
+    return grade_classes.get(grade, "grade-f")
+
+def export_to_csv(dataframe):
+    output = io.BytesIO()
+    csv_data = dataframe.to_csv(index=False, encoding='utf-8-sig')
+    output.write(csv_data.encode('utf-8-sig'))
+    output.seek(0)
+    return output
+
+# ============ ДЕРЕКҚОР ТҮЗЕТУ ФУНКЦИЯЛАРЫ ============
+def fix_database_structure():
+    """Дерекқор құрылымын түзету"""
+    conn = sqlite3.connect('ai_qazaq_teachers.db')
+    c = conn.cursor()
+    
+    try:
+        # Кестелердің бар-жоғын тексеру
+        c.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        tables = [table[0] for table in c.fetchall()]
+        print(f"📊 Қолжетімді кестелер: {tables}")
+        
+        # students кестесінің бағаналарын тексеру
+        c.execute("PRAGMA table_info(students)")
+        columns = c.fetchall()
+        print(f"📋 students кестесінің бағаналары:")
+        for col in columns:
+            print(f"  - {col[1]} ({col[2]})")
+        
+        # academic_performance бағанасын қосу (егер жоқ болса)
+        column_names = [col[1] for col in columns]
+        if 'academic_performance' not in column_names:
+            print("➕ academic_performance бағанасын қосу...")
+            c.execute('''
+                ALTER TABLE students 
+                ADD COLUMN academic_performance TEXT DEFAULT 'Орташа'
+            ''')
+            print("✅ academic_performance бағанасы қосылды!")
+        
+        conn.commit()
+        print("✅ Дерекқор құрылымы түзетілді!")
+        return True
+    except Exception as e:
+        print(f"❌ Дерекқорды түзету қатесі: {e}")
+        return False
+    finally:
+        conn.close()
+
+# ============ МҰҒАЛІМ ФУНКЦИЯЛАРЫ ============
+def register_user(username, password, email, full_name, school, city):
+    conn = sqlite3.connect('ai_qazaq_teachers.db')
+    c = conn.cursor()
+    try:
+        hashed_password = hash_password(password)
+        c.execute(
+            """INSERT INTO teachers (username, password, email, full_name, school, city) 
+            VALUES (?, ?, ?, ?, ?, ?)""",
+            (username, hashed_password, email, full_name, school, city)
+        )
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+    finally:
+        conn.close()
+
+def login_user(username, password):
+    conn = sqlite3.connect('ai_qazaq_teachers.db')
+    c = conn.cursor()
+    hashed_password = hash_password(password)
+    c.execute(
+        """SELECT id, username, full_name, school, city FROM teachers 
+        WHERE username=? AND password=?""",
+        (username, hashed_password)
+    )
+    user = c.fetchone()
+    conn.close()
+    return user
+
+def get_classes(teacher_id):
+    conn = sqlite3.connect('ai_qazaq_teachers.db')
+    c = conn.cursor()
+    c.execute("SELECT id, name, subject, grade_level FROM classes WHERE teacher_id = ? ORDER BY name", (teacher_id,))
+    classes = c.fetchall()
+    conn.close()
+    return classes
+
+def add_class(teacher_id, name, subject, grade_level, description):
+    conn = sqlite3.connect('ai_qazaq_teachers.db')
+    c = conn.cursor()
+    try:
+        c.execute(
+            """INSERT INTO classes (teacher_id, name, subject, grade_level, description) 
+            VALUES (?, ?, ?, ?, ?)""",
+            (teacher_id, name, subject, grade_level, description)
+        )
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"❌ Сынып қосу қатесі: {e}")
+        return False
+    finally:
+        conn.close()
+
+def delete_class(class_id):
+    conn = sqlite3.connect('ai_qazaq_teachers.db')
+    c = conn.cursor()
+    try:
+        c.execute("DELETE FROM student_logins WHERE student_id IN (SELECT id FROM students WHERE class_id = ?)", (class_id,))
+        c.execute("DELETE FROM students WHERE class_id = ?", (class_id,))
+        c.execute("DELETE FROM bzb_tasks WHERE class_id = ?", (class_id,))
+        c.execute("DELETE FROM classes WHERE id = ?", (class_id,))
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"❌ Сыныпты жою қатесі: {e}")
+        return False
+    finally:
+        conn.close()
+
+def get_students_by_class(class_id):
+    conn = sqlite3.connect('ai_qazaq_teachers.db')
+    c = conn.cursor()
+    try:
+        c.execute("SELECT * FROM students WHERE class_id = ? ORDER BY full_name", (class_id,))
+        students = c.fetchall()
+        return students
+    except Exception as e:
+        print(f"❌ Оқушыларды алу қатесі: {e}")
+        return []
+    finally:
+        conn.close()
+
+def add_student(class_id, full_name, student_code, grade_points, academic_performance):
+    conn = sqlite3.connect('ai_qazaq_teachers.db')
+    c = conn.cursor()
+    try:
+        # grade_points мәнін санға түрлендіру
+        try:
+            if isinstance(grade_points, str):
+                grade_points_int = int(float(grade_points.strip()))
+            else:
+                grade_points_int = int(grade_points)
+        except (ValueError, TypeError):
+            grade_points_int = 5
+        
+        # Шектеулер
+        if grade_points_int < 1:
+            grade_points_int = 1
+        elif grade_points_int > 10:
+            grade_points_int = 10
+        
+        if not academic_performance:
+            academic_performance = "Орташа"
+        
+        # Бағаналарды тексеру
+        c.execute("PRAGMA table_info(students)")
+        columns = [col[1] for col in c.fetchall()]
+        
+        if 'academic_performance' not in columns:
+            # academic_performance бағанасын қосу
+            c.execute('ALTER TABLE students ADD COLUMN academic_performance TEXT DEFAULT "Орташа"')
+            conn.commit()
+        
+        # Оқушыны қосу
+        c.execute(
+            """INSERT INTO students (class_id, full_name, student_code, grade_points, academic_performance) 
+            VALUES (?, ?, ?, ?, ?)""",
+            (class_id, full_name, student_code, grade_points_int, academic_performance)
+        )
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError as e:
+        print(f"❌ Оқушы қосу қатесі (интеграция): {e}")
+        return False
+    except Exception as e:
+        print(f"❌ Оқушы қосу қатесі: {e}")
+        return False
+    finally:
+        conn.close()
+
+def delete_student(student_id):
+    conn = sqlite3.connect('ai_qazaq_teachers.db')
+    c = conn.cursor()
+    try:
+        c.execute("DELETE FROM student_logins WHERE student_id = ?", (student_id,))
+        c.execute("DELETE FROM students WHERE id = ?", (student_id,))
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"❌ Оқушыны жою қатесі: {e}")
+        return False
+    finally:
+        conn.close()
+
+def register_student_login(student_id, username, password):
+    conn = sqlite3.connect('ai_qazaq_teachers.db')
+    c = conn.cursor()
+    try:
+        c.execute("SELECT id FROM students WHERE id = ?", (student_id,))
+        if not c.fetchone():
+            conn.close()
+            return False, "Оқушы табылмады"
+        
+        c.execute("SELECT id FROM student_logins WHERE username = ?", (username,))
+        if c.fetchone():
+            conn.close()
+            return False, "Бұл логин бос емес"
+        
+        c.execute("SELECT id FROM student_logins WHERE student_id = ?", (student_id,))
+        if c.fetchone():
+            conn.close()
+            return False, "Оқушыда логин бар"
+        
+        hashed_password = hash_password(password)
+        c.execute(
+            """INSERT INTO student_logins (student_id, username, password) 
+            VALUES (?, ?, ?)""",
+            (student_id, username, hashed_password)
+        )
+        conn.commit()
+        return True, "Сәтті тіркелді"
+    except sqlite3.IntegrityError as e:
+        return False, f"Дерекқор қатесі: {str(e)}"
+    except Exception as e:
+        return False, f"Қате: {str(e)}"
+    finally:
+        conn.close()
+
+def get_student_logins(student_id):
+    conn = sqlite3.connect('ai_qazaq_teachers.db')
+    c = conn.cursor()
+    c.execute("SELECT id, username FROM student_logins WHERE student_id = ?", (student_id,))
+    logins = c.fetchall()
+    conn.close()
+    return logins
+
+def update_student_password(login_id, new_password):
+    conn = sqlite3.connect('ai_qazaq_teachers.db')
+    c = conn.cursor()
+    try:
+        hashed_password = hash_password(new_password)
+        c.execute(
+            "UPDATE student_logins SET password = ? WHERE id = ?",
+            (hashed_password, login_id)
+        )
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"❌ Құпия сөзді өзгерту қатесі: {e}")
+        return False
+    finally:
+        conn.close()
+
+def delete_student_login(login_id):
+    conn = sqlite3.connect('ai_qazaq_teachers.db')
+    c = conn.cursor()
+    try:
+        c.execute("DELETE FROM student_logins WHERE id = ?", (login_id,))
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"❌ Логинды жою қатесі: {e}")
+        return False
+    finally:
+        conn.close()
+
+def save_file_to_db(teacher_id, file_name, file_data, category):
+    conn = sqlite3.connect('ai_qazaq_teachers.db')
+    c = conn.cursor()
+    try:
+        file_bytes = file_data.read()
+        file_type = file_data.type
+        c.execute(
+            """INSERT INTO visual_materials 
+            (teacher_id, file_name, file_data, file_type, file_size, category) 
+            VALUES (?, ?, ?, ?, ?, ?)""",
+            (teacher_id, file_name, file_bytes, file_type, len(file_bytes), category)
+        )
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"❌ Файлды сақтау қатесі: {e}")
+        return False
+    finally:
+        conn.close()
+
+def get_saved_files(teacher_id):
+    conn = sqlite3.connect('ai_qazaq_teachers.db')
+    c = conn.cursor()
+    try:
+        c.execute(
+            """SELECT id, file_name, file_type, file_size, 
+                      category, upload_date, file_data
+               FROM visual_materials 
+               WHERE teacher_id = ? 
+               ORDER BY upload_date DESC""",
+            (teacher_id,)
+        )
+        
+        files = []
+        for row in c.fetchall():
+            files.append({
+                'id': row[0],
+                'name': row[1],
+                'type': row[2],
+                'size': f"{row[3]} байт",
+                'category': row[4],
+                'uploaded': row[5],
+                'data': row[6]
+            })
+        return files
+    except Exception as e:
+        print(f"❌ Файлдарды алу қатесі: {e}")
+        return []
+    finally:
+        conn.close()
+
+def delete_file(file_id):
+    conn = sqlite3.connect('ai_qazaq_teachers.db')
+    c = conn.cursor()
+    try:
+        c.execute("DELETE FROM visual_materials WHERE id = ?", (file_id,))
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"❌ Файлды жою қатесі: {e}")
+        return False
+    finally:
+        conn.close()
+
+def get_visual_material(file_id):
+    conn = sqlite3.connect('ai_qazaq_teachers.db')
+    c = conn.cursor()
+    try:
+        c.execute(
+            """SELECT file_name, file_data, file_type 
+               FROM visual_materials 
+               WHERE id = ?""",
+            (file_id,)
+        )
+        file = c.fetchone()
+        if file:
+            return {
+                'name': file[0],
+                'data': file[1],
+                'type': file[2]
+            }
+        return None
+    except Exception as e:
+        print(f"❌ Файлды алу қатесі: {e}")
+        return None
+    finally:
+        conn.close()
+
+def save_bzb_task(teacher_id, class_id, task_name, task_file, file_type, completion_rate, difficulty_level):
+    conn = sqlite3.connect('ai_qazaq_teachers.db')
+    c = conn.cursor()
+    try:
+        file_bytes = task_file.read()
+        ai_solution = generate_ai_solution(completion_rate, difficulty_level)
+        c.execute(
+            """INSERT INTO bzb_tasks 
+            (teacher_id, class_id, task_name, task_file, file_type, completion_rate, difficulty_level, ai_solution) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (teacher_id, class_id, task_name, file_bytes, file_type, completion_rate, difficulty_level, ai_solution)
+        )
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"❌ БЖБ тапсырмасын сақтау қатесі: {e}")
+        return False
+    finally:
+        conn.close()
+
+def generate_ai_solution(completion_rate, difficulty_level):
+    solutions = {
+        "Оңай": {
+            "low": "• Қарапайым түсініктемелер\n• Қадамдық нұсқаулар\n• Мысалдар келтіру",
+            "medium": "• Толық түсіндірме\n• Формулаларды түсіндіру\n• Практикалық мысалдар",
+            "high": "• Талдау және шешім\n• Баламалы тәсілдер\n• Түбіне дейін зерттеу"
+        },
+        "Орташа": {
+            "low": "• Негізгі түсініктемелер\n• Қадам-қалам нұсқау\n• Жеңілдетілген тәсіл",
+            "medium": "• Толық талдау\n• Формулалар мен ережелер\n• Мысалдармен түсіндіру",
+            "high": "• Кешенді түсініктеме\n• Ғылыми тәсілдер\n• Қосымша ресурстар"
+        }
+    }
+    
+    if completion_rate < 30:
+        level = "low"
+    elif completion_rate < 70:
+        level = "medium"
+    else:
+        level = "high"
+    
+    return solutions.get(difficulty_level, {}).get(level, "Шешім табылмады")
+
+def get_bzb_tasks(teacher_id):
+    conn = sqlite3.connect('ai_qazaq_teachers.db')
+    c = conn.cursor()
+    try:
+        c.execute("""
+        SELECT b.id, b.task_name, b.file_type, b.upload_date, 
+               b.completion_rate, b.difficulty_level, b.ai_solution,
+               c.name as class_name
+        FROM bzb_tasks b
+        JOIN classes c ON b.class_id = c.id
+        WHERE b.teacher_id = ?
+        ORDER BY b.upload_date DESC
+        """, (teacher_id,))
+        
+        tasks = []
+        for row in c.fetchall():
+            tasks.append({
+                'id': row[0],
+                'name': row[1],
+                'type': row[2],
+                'uploaded': row[3],
+                'rate': row[4],
+                'difficulty': row[5],
+                'ai_solution': row[6],
+                'class_name': row[7]
+            })
+        return tasks
+    except Exception as e:
+        print(f"❌ БЖБ тапсырмаларын алу қатесі: {e}")
+        return []
+    finally:
+        conn.close()
+
+def get_bzb_task(task_id):
+    conn = sqlite3.connect('ai_qazaq_teachers.db')
+    c = conn.cursor()
+    try:
+        c.execute(
+            """SELECT task_name, task_file, file_type, ai_solution
+               FROM bzb_tasks 
+               WHERE id = ?""",
+            (task_id,)
+        )
+        task = c.fetchone()
+        if task:
+            return {
+                'name': task[0],
+                'data': task[1],
+                'type': task[2],
+                'ai_solution': task[3]
+            }
+        return None
+    except Exception as e:
+        print(f"❌ БЖБ тапсырмасын алу қатесі: {e}")
+        return None
+    finally:
+        conn.close()
+
+def get_class_count(teacher_id):
+    conn = sqlite3.connect('ai_qazaq_teachers.db')
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM classes WHERE teacher_id=?", (teacher_id,))
+    count = c.fetchone()[0]
+    conn.close()
+    return count
+
+def get_student_count(teacher_id):
+    conn = sqlite3.connect('ai_qazaq_teachers.db')
+    c = conn.cursor()
+    c.execute("""SELECT COUNT(*) FROM students s 
+                 JOIN classes c ON s.class_id = c.id 
+                 WHERE c.teacher_id=?""", (teacher_id,))
+    count = c.fetchone()[0]
+    conn.close()
+    return count
+
+# ============ ОҚУШЫЛАРҒА ТАПСЫРМАЛАР ФУНКЦИЯЛАРЫ ============
+
+def save_student_task(teacher_id, student_id, class_id, task_name, task_description, task_file, file_type, due_date, points):
+    """Оқушыға тапсырма сақтау"""
+    conn = sqlite3.connect('ai_qazaq_teachers.db')
+    c = conn.cursor()
+    
+    try:
+        if task_file:
+            file_bytes = task_file.read()
+        else:
+            file_bytes = None
+        
+        c.execute(
+            """INSERT INTO student_tasks 
+            (teacher_id, student_id, class_id, task_name, task_description, 
+             task_file, file_type, due_date, points) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (teacher_id, student_id, class_id, task_name, task_description,
+             file_bytes, file_type, due_date, points)
+        )
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"❌ Тапсырма сақтау қатесі: {e}")
+        return False
+    finally:
+        conn.close()
+
+def get_student_tasks_by_teacher(teacher_id):
+    """Мұғалім берген тапсырмаларды алу"""
+    conn = sqlite3.connect('ai_qazaq_teachers.db')
+    c = conn.cursor()
+    
+    try:
+        c.execute("""
+        SELECT st.id, st.task_name, st.task_description, st.due_date, st.points,
+               st.status, st.assigned_date, st.feedback, st.completed_date,
+               s.full_name as student_name, s.student_code,
+               c.name as class_name
+        FROM student_tasks st
+        JOIN students s ON st.student_id = s.id
+        JOIN classes c ON st.class_id = c.id
+        WHERE st.teacher_id = ?
+        ORDER BY st.due_date DESC
+        """, (teacher_id,))
+        
+        tasks = []
+        for row in c.fetchall():
+            tasks.append({
+                'id': row[0],
+                'task_name': row[1],
+                'description': row[2],
+                'due_date': row[3],
+                'points': row[4],
+                'status': row[5],
+                'assigned_date': row[6],
+                'feedback': row[7],
+                'completed_date': row[8],
+                'student_name': row[9],
+                'student_code': row[10],
+                'class_name': row[11]
+            })
+        return tasks
+    except Exception as e:
+        print(f"❌ Тапсырмаларды алу қатесі: {e}")
+        return []
+    finally:
+        conn.close()
+
+def get_student_task_file(task_id):
+    """Тапсырма файлын алу"""
+    conn = sqlite3.connect('ai_qazaq_teachers.db')
+    c = conn.cursor()
+    
+    try:
+        c.execute(
+            """SELECT task_name, task_file, file_type 
+               FROM student_tasks 
+               WHERE id = ?""",
+            (task_id,)
+        )
+        
+        task = c.fetchone()
+        if task:
+            return {
+                'name': task[0],
+                'data': task[1],
+                'type': task[2]
+            }
+        return None
+    except Exception as e:
+        print(f"❌ Тапсырма файлын алу қатесі: {e}")
+        return None
+    finally:
+        conn.close()
+
+def update_task_status(task_id, status, feedback=None):
+    """Тапсырма статусын жаңарту"""
+    conn = sqlite3.connect('ai_qazaq_teachers.db')
+    c = conn.cursor()
+    
+    try:
+        if status == 'Орындалды':
+            c.execute(
+                """UPDATE student_tasks 
+                   SET status = ?, feedback = ?, completed_date = CURRENT_TIMESTAMP
+                   WHERE id = ?""",
+                (status, feedback, task_id)
+            )
+        else:
+            c.execute(
+                """UPDATE student_tasks 
+                   SET status = ?, feedback = ?
+                   WHERE id = ?""",
+                (status, feedback, task_id)
+            )
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"❌ Статус жаңарту қатесі: {e}")
+        return False
+    finally:
+        conn.close()
+
+def get_student_tasks_by_student(student_id):
+    """Оқушыға берілген тапсырмаларды алу"""
+    conn = sqlite3.connect('ai_qazaq_teachers.db')
+    c = conn.cursor()
+    
+    try:
+        c.execute("""
+        SELECT st.id, st.task_name, st.task_description, st.due_date, st.points,
+               st.status, st.assigned_date, st.feedback, st.completed_date,
+               t.full_name as teacher_name,
+               c.name as class_name
+        FROM student_tasks st
+        JOIN teachers t ON st.teacher_id = t.id
+        JOIN classes c ON st.class_id = c.id
+        WHERE st.student_id = ?
+        ORDER BY st.due_date DESC
+        """, (student_id,))
+        
+        tasks = []
+        for row in c.fetchall():
+            tasks.append({
+                'id': row[0],
+                'task_name': row[1],
+                'description': row[2],
+                'due_date': row[3],
+                'points': row[4],
+                'status': row[5],
+                'assigned_date': row[6],
+                'feedback': row[7],
+                'completed_date': row[8],
+                'teacher_name': row[9],
+                'class_name': row[10]
+            })
+        return tasks
+    except Exception as e:
+        print(f"❌ Оқушы тапсырмаларын алу қатесі: {e}")
+        return []
+    finally:
+        conn.close()
+
+def delete_student_task(task_id):
+    """Тапсырманы жою"""
+    conn = sqlite3.connect('ai_qazaq_teachers.db')
+    c = conn.cursor()
+    
+    try:
+        c.execute("DELETE FROM student_tasks WHERE id = ?", (task_id,))
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"❌ Тапсырманы жою қатесі: {e}")
+        return False
+    finally:
+        conn.close()
+
+# ============ ОҚУШЫ ПОРТАЛЫ ФУНКЦИЯЛАРЫ ============
+
+def student_login(username, password):
+    """Оқушы кіруі"""
+    conn = sqlite3.connect('ai_qazaq_teachers.db')
+    c = conn.cursor()
+    hashed_password = hash_password(password)
+    
+    try:
+        c.execute("""
+        SELECT s.id, s.full_name, s.student_code, s.class_id, c.name as class_name,
+               c.subject, s.grade_points, s.academic_performance
+        FROM students s
+        JOIN student_logins sl ON s.id = sl.student_id
+        JOIN classes c ON s.class_id = c.id
+        WHERE sl.username = ? AND sl.password = ?
+        """, (username, hashed_password))
+        
+        student = c.fetchone()
+        
+        # Егер academic_performance жоқ болса, әдепкі мән қосу
+        if student and len(student) == 7:  # academic_performance жоқ
+            student = student + ("Орташа",)
+        
+        return student
+    except Exception as e:
+        print(f"❌ Оқушы кіру қатесі: {e}")
+        return None
+    finally:
+        conn.close()
+
+# ============ КӨРСЕТУ ФУНКЦИЯЛАРЫ ============
+def preview_file(file_data, file_type, file_name):
+    st.markdown(f"### 📄 {file_name}")
+    
+    if file_type.startswith('image/'):
+        st.image(file_data, caption=file_name, use_container_width=True)
+    elif file_type == 'application/pdf':
+        st.warning("PDF файлды тікелей көрсету мүмкін емес. Файлды жүктеп алыңыз.")
+        base64_pdf = base64.b64encode(file_data).decode('utf-8')
+        pdf_display = f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="500px"></iframe>'
+        st.markdown(pdf_display, unsafe_allow_html=True)
+    elif file_type == 'text/plain' or file_type.endswith('.txt'):
+        try:
+            text_content = file_data.decode('utf-8')
+            st.text_area("📝 Файл мазмұны", text_content, height=300)
+        except:
+            st.warning("Мәтінді декодтау мүмкін болмады")
+    elif file_type.startswith('video/'):
+        st.video(file_data)
+    elif file_type.startswith('audio/'):
+        st.audio(file_data)
+    else:
+        st.info(f"📁 Файл түрі: {file_type}")
+        st.info(f"📁 Файл атауы: {file_name}")
+
+# ============ МӘТІНДЕР ============
+texts = {
+    "kk": {
+        "title": "AI QAZAQ Teachers",
+        "subtitle": "Қазақстандық мұғалімдерге арналған AI платформасы",
+        "login": "✅ Кіру",
+        "register": "📝 Тіркелу",
+        "username": "👤 Пайдаланушы аты",
+        "password": "🔒 Құпия сөз",
+        "fullname": "📛 Толық аты-жөні",
+        "email": "📧 Электронды пошта",
+        "school": "🏫 Мектеп атауы",
+        "confirm_pass": "🔐 Құпия сөзді растау",
+        "welcome": "🎉 Қош келдіңіз",
+        "dashboard": "📊 Басқару панелі",
+        "classes": "🏫 Сыныптар",
+        "students": "👨‍🎓 Оқушылар",
+        "student_performance": "📊 Оқушылардың үлгерімі",
+        "bzb_tasks": "📝 БЖБ тапсырмалары",
+        "student_tasks": "🎯 Оқушыларға тапсырмалар",
+        "visual_materials": "📁 Көрнекіліктер",
+        "ai_tools": "🤖 AI құралдары",
+        "logout": "🚪 Шығу",
+        "add_class": "➕ Жаңа сынып",
+        "class_name": "Сынып атауы",
+        "subject": "Пән",
+        "description": "Сипаттама",
+        "add": "Қосу",
+        "import_students": "📥 Оқушыларды импорттау",
+        "select_class": "Сыныпты таңдаңыз",
+        "no_classes": "Сізде әлі сыныптар жоқ",
+        "student_added": "✅ Оқушы сәтті қосылды!",
+        "class_deleted": "✅ Сынып сәтті жойылды!",
+        "delete_warning": "⚠️ Сыныпты жоюға сенімдісіз бе? Бұл әрекетті кері қайтару мүмкін емес!",
+        "add_student": "➕ Оқушы қосу",
+        "student_name": "Оқушының аты-жөні",
+        "student_id": "Оқушының коды",
+        "import_excel": "Excel файлын жүктеу",
+        "no_students": "📚 Бұл сыныпта оқушялар әлі жоқ",
+        "points": "Ұпай",
+        "academic_performance": "📚 Оқу үлгерімі",
+        "delete_student": "🗑️ Оқушыны жою",
+        "student_portal": "🎒 Оқушы порталы",
+        "ai_lesson_plan": "AI сабақ жоспары",
+        "student_analysis": "Оқушы талдауы",
+        "task_generator": "Тапсырма генераторы",
+        "assessment_rubric": "Бағалау критерийлері",
+        "predictive_analysis": "Прогноздық талдау",
+        "teaching_advice": "Педагогикалық кеңестер",
+        "ai_assistant": "AI көмекші",
+        "back": "Артқа",
+        "generate": "Жасау",
+        "analyze": "Талдау",
+        "create": "Құру",
+        "view_analysis": "Талдауды қарау",
+        "class": "Сынып",
+        "average_grade": "Орташа баға",
+        "performance_level": "Оқу деңгейі",
+        "grade_distribution": "Бағалардың таралуы",
+        "export_to_excel": "📥 Excel-ге экспорттау",
+        "filter_by_class": "Сынып бойынша сүзгі",
+        "filter_by_subject": "Пән бойынша сүзгі",
+        "view_details": "Толығырақ қарау",
+        "total_students": "Барлық оқушылар",
+        "excellent": "Өте жақсы",
+        "good": "Жақсы",
+        "average": "Орташа",
+        "satisfactory": "Қанағаттанарлықсыз",
+        "weak": "Әлсіз",
+        "assign_task": "➕ Тапсырма беру",
+        "task_name": "Тапсырма атауы",
+        "task_description": "Тапсырма сипаттамасы",
+        "due_date": "Мерзімі",
+        "upload_file": "Файл жүктеу",
+        "status": "Статус",
+        "assigned": "Тапсырылды",
+        "not_completed": "Орындалмады",
+        "completed": "Орындалды",
+        "late": "Кешікті",
+        "view_tasks": "Тапсырмаларды қарау",
+        "feedback": "Кері байланыс",
+        "give_feedback": "Кері байланыс беру",
+        "mark_completed": "Орындалды деп белгілеу",
+        "download_task": "Тапсырманы жүктеп алу",
+        "in_progress": "Орындалуда",
+        "all_tasks": "Барлық тапсырмалар",
+        "submit_answer": "Жауап жіберу",
+        "answer_text": "Жауап мәтіні",
+        "answer_file": "Жауап файлы",
+        "submit": "Жіберу"
+    }
+}
+
+# ============ МҰҒАЛІМ ПОРТАЛЫ БӨЛІМДЕРІ ============
+def show_logo_header():
+    t = texts[st.session_state.language]
+    
+    st.markdown(f"""
+    <div style='background: linear-gradient(135deg, #0066CC, #CC0000); 
+                padding: 1.5rem; border-radius: 10px; color: white; margin-bottom: 20px;'>
+        <h1 style='margin: 0; text-align: center;'>🇰🇿 AI QAZAQ TEACHERS</h1>
+        <p style='margin: 0; text-align: center; font-size: 1.2rem;'>{t['subtitle']}</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+def show_dashboard():
+    t = texts[st.session_state.language]
+    
+    with st.sidebar:
+        st.markdown(f"""
+        <div style='background: linear-gradient(135deg, #0066CC, #CC0000); 
+                    padding: 1.5rem; border-radius: 10px; color: white;'>
+            <h2 style='margin: 0; text-align: center;'>🇰🇿 AI QAZAQ</h2>
+            <p style='margin: 0; text-align: center; font-size: 0.9rem;'>TEACHERS</p>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        st.markdown(f"""
+        <div class='teacher-card'>
+            <h4>👨‍🏫 {st.session_state.user[2]}</h4>
+            <p>🏫 {st.session_state.user[3]}</p>
+            <p>📍 {st.session_state.user[4]}</p>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        st.markdown("---")
+        
+        menu_options = [
+            ("🏫", t['classes']),
+            ("👨‍🎓", t['students']),
+            ("📊", t['student_performance']),
+            ("📝", t['bzb_tasks']),
+            ("🎯", t['student_tasks']),
+            ("📁", t['visual_materials']),
+            ("🤖", t['ai_tools']),
+        ]
+        
+        selected_menu = st.radio(
+            "📋 Бөлімдер",
+            [opt[1] for opt in menu_options],
+            index=0
+        )
+        
+        st.markdown("---")
+        
+        if st.button(f"🚪 {t['logout']}", use_container_width=True, type="primary"):
+            clear_user_session()
+            st.session_state.clear()
+            st.rerun()
+    
+    if st.session_state.preview_file:
+        show_file_preview()
+        return
+    
+    if st.session_state.ai_tool_page:
+        if st.session_state.ai_tool_page == "lesson_plan":
+            show_ai_lesson_plan()
+        elif st.session_state.ai_tool_page == "student_analysis":
+            show_student_analysis()
+        elif st.session_state.ai_tool_page == "task_generator":
+            show_task_generator()
+        elif st.session_state.ai_tool_page == "assessment_rubric":
+            show_assessment_rubric()
+        elif st.session_state.ai_tool_page == "predictive_analysis":
+            show_predictive_analysis()
+        elif st.session_state.ai_tool_page == "teaching_advice":
+            show_teaching_advice()
+        elif st.session_state.ai_tool_page == "ai_assistant":
+            show_ai_assistant()
+        return
+    
+    if selected_menu == t['classes']:
+        show_classes_management()
+    elif selected_menu == t['students']:
+        show_students_management()
+    elif selected_menu == t['student_performance']:
+        show_student_performance()
+    elif selected_menu == t['bzb_tasks']:
+        show_bzb_tasks()
+    elif selected_menu == t['student_tasks']:
+        show_student_tasks()
+    elif selected_menu == t['visual_materials']:
+        show_visual_materials()
+    elif selected_menu == t['ai_tools']:
+        show_ai_tools()
+
+# ============ ОҚУШЫЛАРҒА ТАПСЫРМАЛАР БӨЛІМІ ============
+
+def show_student_tasks():
+    """Оқушыларға тапсырмалар бөлімі"""
+    t = texts[st.session_state.language]
+    
+    st.markdown(f"<h2>🎯 {t['student_tasks']}</h2>", unsafe_allow_html=True)
+    
+    # Бөлімдер
+    tab1, tab2 = st.tabs(["📤 Тапсырма беру", "📋 Тапсырмалар тізімі"])
+    
+    with tab1:
+        show_assign_task_form()
+    
+    with tab2:
+        show_assigned_tasks_list()
+
+def show_assign_task_form():
+    """Тапсырма беру формасы"""
+    t = texts[st.session_state.language]
+    
+    st.subheader("📤 Оқушыға тапсырма беру")
+    
+    # Сыныпты таңдау
+    classes = get_classes(st.session_state.user[0])
+    if not classes:
+        st.info("Алдымен сынып қосыңыз.")
+        return
+    
+    class_options = {f"{c[1]} (Сынып {c[3]})": c[0] for c in classes}
+    selected_class_name = st.selectbox("🎯 Сыныпты таңдаңыз", list(class_options.keys()))
+    selected_class_id = class_options[selected_class_name]
+    
+    # Оқушыны таңдау
+    students = get_students_by_class(selected_class_id)
+    if not students:
+        st.info("Бұл сыныпта оқушылар жоқ.")
+        return
+    
+    student_options = {f"{s[2]} ({s[3]})": s[0] for s in students}
+    selected_student_name = st.selectbox("👨‍🎓 Оқушыны таңдаңыз", list(student_options.keys()))
+    selected_student_id = student_options[selected_student_name]
+    
+    # Тапсырма формасы
+    with st.form("assign_task_form"):
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            task_name = st.text_input(f"📝 {t['task_name']}", placeholder="Тапсырма атауы")
+            due_date = st.date_input(f"📅 {t['due_date']}", 
+                                    value=datetime.now().date() + timedelta(days=7))
+        
+        with col2:
+            points = st.number_input(f"⭐ {t['points']}", min_value=0, max_value=100, value=10)
+            task_file = st.file_uploader(
+                f"📁 {t['upload_file']}",
+                type=['pdf', 'doc', 'docx', 'txt', 'xlsx', 'pptx', 'jpg', 'png'],
+                help="Тапсырма файлын жүктеңіз (міндетті емес)"
+            )
+        
+        task_description = st.text_area(
+            f"📄 {t['task_description']}",
+            placeholder="Тапсырманың толық сипаттамасы...",
+            height=150
+        )
+        
+        submit_button = st.form_submit_button(f"🚀 {t['assign_task']}", use_container_width=True)
+        
+        if submit_button:
+            if task_name:
+                file_type = task_file.type if task_file else None
+                
+                if save_student_task(
+                    st.session_state.user[0],
+                    selected_student_id,
+                    selected_class_id,
+                    task_name,
+                    task_description,
+                    task_file,
+                    file_type,
+                    due_date.strftime('%Y-%m-%d'),
+                    points
+                ):
+                    st.success(f"✅ Тапсырма '{task_name}' сәтті жіберілді!")
+                    time.sleep(1)
+                    st.rerun()
+                else:
+                    st.error("❌ Тапсырманы сақтау кезінде қате пайда болды")
+            else:
+                st.error("❌ Тапсырма атауын толтырыңыз!")
+
+def show_assigned_tasks_list():
+    """Тапсырмалар тізімін көрсету"""
+    t = texts[st.session_state.language]
+    
+    st.subheader("📋 Жіберілген тапсырмалар")
+    
+    tasks = get_student_tasks_by_teacher(st.session_state.user[0])
+    
+    if not tasks:
+        st.info("📭 Жіберілген тапсырмалар жоқ")
+        return
+    
+    # Сүзгілер
+    col_filter1, col_filter2, col_filter3 = st.columns(3)
+    
+    with col_filter1:
+        status_filter = st.selectbox(
+            "Статус бойынша сүзгі",
+            ["Барлығы", "Жіберілмеді", "Орындалды", "Кешікті", "Орындалуда"]
+        )
+    
+    with col_filter2:
+        class_filter = st.selectbox(
+            "Сынып бойынша сүзгі",
+            ["Барлығы"] + list(set([t['class_name'] for t in tasks]))
+        )
+    
+    with col_filter3:
+        search_query = st.text_input("Тапсырма атауы бойынша іздеу")
+    
+    # Тапсырмаларды сүзу
+    filtered_tasks = tasks
+    if status_filter != "Барлығы":
+        filtered_tasks = [t for t in filtered_tasks if t['status'] == status_filter]
+    if class_filter != "Барлығы":
+        filtered_tasks = [t for t in filtered_tasks if t['class_name'] == class_filter]
+    if search_query:
+        filtered_tasks = [t for t in filtered_tasks if search_query.lower() in t['task_name'].lower()]
+    
+    if not filtered_tasks:
+        st.info("📭 Сүзгілерге сәйкес тапсырмалар табылмады")
+        return
+    
+    # Тапсырмаларды көрсету
+    for task in filtered_tasks:
+        # Статус бойынша түс
+        status_colors = {
+            "Жіберілмеді": "#6c757d",
+            "Орындалды": "#28a745",
+            "Кешікті": "#dc3545",
+            "Орындалуда": "#ffc107"
+        }
+        status_color = status_colors.get(task['status'], "#6c757d")
+        
+        with st.expander(
+            f"{task['task_name']} - {task['student_name']} ({task['class_name']})"
+        ):
+            col_info1, col_info2, col_info3 = st.columns(3)
+            
+            with col_info1:
+                st.markdown(f"**Оқушы:** {task['student_name']}")
+                st.markdown(f"**Код:** {task['student_code']}")
+                st.markdown(f"**Сынып:** {task['class_name']}")
+            
+            with col_info2:
+                st.markdown(f"**Мерзімі:** {task['due_date']}")
+                st.markdown(f"**Балл:** {task['points']}")
+                st.markdown(f"**Жіберілген күні:** {task['assigned_date']}")
+            
+            with col_info3:
+                st.markdown(f"""
+                <div style='background-color: {status_color}; color: white; 
+                            padding: 10px; border-radius: 5px; text-align: center;'>
+                    <strong>Статус:</strong> {task['status']}
+                </div>
+                """, unsafe_allow_html=True)
+            
+            if task['description']:
+                st.markdown("**Сипаттама:**")
+                st.info(task['description'])
+            
+            if task['completed_date']:
+                st.markdown(f"**Орындалған күні:** {task['completed_date']}")
+            
+            if task['feedback']:
+                st.markdown("**Кері байланыс:**")
+                st.success(task['feedback'])
+            
+            # Файлды жүктеп алу
+            task_file = get_student_task_file(task['id'])
+            if task_file and task_file['data']:
+                st.markdown("---")
+                st.markdown("### 📄 Тапсырма файлы")
+                
+                col_file1, col_file2 = st.columns([2, 1])
+                
+                with col_file1:
+                    file_extension = get_file_extension(task_file['type'])
+                    st.info(f"Файл түрі: {task_file['type']}")
+                    st.info(f"Файл атауы: {task_file['name']}")
+                
+                with col_file2:
+                    st.download_button(
+                        label="📥 Файлды жүктеп алу",
+                        data=task_file['data'],
+                        file_name=f"{task_file['name']}.{file_extension}",
+                        mime=task_file['type'],
+                        key=f"download_task_{task['id']}"
+                    )
+            
+            # Әрекет түймелері
+            st.markdown("---")
+            st.markdown("### 🎯 Әрекеттер")
+            
+            col_actions1, col_actions2, col_actions3, col_actions4 = st.columns(4)
+            
+            with col_actions1:
+                # Кері байланыс беру
+                if task['status'] != 'Орындалды':
+                    if st.button(f"💬 {t['give_feedback']}", key=f"feedback_{task['id']}"):
+                        st.session_state[f"show_feedback_{task['id']}"] = True
+                
+                if st.session_state.get(f"show_feedback_{task['id']}", False):
+                    feedback_text = st.text_area(
+                        "Кері байланыс:",
+                        value=task.get('feedback', ''),
+                        key=f"feedback_text_{task['id']}"
+                    )
+                    
+                    if st.button("📤 Кері байланыс жіберу", key=f"send_feedback_{task['id']}"):
+                        if update_task_status(task['id'], task['status'], feedback_text):
+                            st.success("✅ Кері байланыс жіберілді!")
+                            time.sleep(1)
+                            st.rerun()
+                        else:
+                            st.error("❌ Кері байланысты жіберу кезінде қате пайда болды")
+            
+            with col_actions2:
+                # Орындалды деп белгілеу
+                if task['status'] != 'Орындалды':
+                    if st.button(f"✅ {t['mark_completed']}", key=f"complete_{task['id']}"):
+                        st.session_state[f"show_complete_{task['id']}"] = True
+                
+                if st.session_state.get(f"show_complete_{task['id']}", False):
+                    feedback_text = st.text_area(
+                        "Баға және түсініктеме:",
+                        placeholder="Мысалы: Өте жақсы! 10/10 балл",
+                        key=f"complete_feedback_{task['id']}"
+                    )
+                    
+                    if st.button("🎯 Орындалды деп белгілеу", key=f"mark_complete_{task['id']}"):
+                        if update_task_status(task['id'], 'Орындалды', feedback_text):
+                            st.success("✅ Тапсырма орындалды деп белгіленді!")
+                            time.sleep(1)
+                            st.rerun()
+                        else:
+                            st.error("❌ Статусты өзгерту кезінде қате пайда болды")
+            
+            with col_actions3:
+                # Статусты өзгерту
+                new_status = st.selectbox(
+                    "Статусты өзгерту:",
+                    ["Жіберілмеді", "Орындалуда", "Кешікті", "Орындалды"],
+                    index=["Жіберілмеді", "Орындалуда", "Кешікті", "Орындалды"].index(task['status']),
+                    key=f"status_select_{task['id']}"
+                )
+                
+                if st.button("🔄 Статусты жаңарту", key=f"update_status_{task['id']}"):
+                    if new_status != task['status']:
+                        if update_task_status(task['id'], new_status, task.get('feedback', '')):
+                            st.success(f"✅ Статус '{new_status}' деп жаңартылды!")
+                            time.sleep(1)
+                            st.rerun()
+                        else:
+                            st.error("❌ Статусты жаңарту кезінде қате пайда болды")
+            
+            with col_actions4:
+                # Тапсырманы жою
+                if st.button("🗑️ Тапсырманы жою", key=f"delete_task_{task['id']}"):
+                    if st.checkbox(f"'{task['task_name']}' тапсырмасын жоюға сенімдісіз бе?", key=f"confirm_delete_{task['id']}"):
+                        if delete_student_task(task['id']):
+                            st.success("✅ Тапсырма жойылды!")
+                            time.sleep(1)
+                            st.rerun()
+                        else:
+                            st.error("❌ Тапсырманы жою кезінде қате пайда болды")
+    
+    # Статистика
+    st.markdown("---")
+    st.subheader("📊 Тапсырмалар статистикасы")
+    
+    total_tasks = len(tasks)
+    completed_tasks = len([t for t in tasks if t['status'] == 'Орындалды'])
+    pending_tasks = len([t for t in tasks if t['status'] == 'Жіберілмеді'])
+    late_tasks = len([t for t in tasks if t['status'] == 'Кешікті'])
+    in_progress_tasks = len([t for t in tasks if t['status'] == 'Орындалуда'])
+    
+    col_stat1, col_stat2, col_stat3, col_stat4, col_stat5 = st.columns(5)
+    
+    with col_stat1:
+        st.metric("Барлығы", total_tasks)
+    
+    with col_stat2:
+        st.metric("Орындалған", completed_tasks, f"{(completed_tasks/total_tasks*100):.1f}%" if total_tasks > 0 else "0%")
+    
+    with col_stat3:
+        st.metric("Күтілуде", pending_tasks)
+    
+    with col_stat4:
+        st.metric("Орындалуда", in_progress_tasks)
+    
+    with col_stat5:
+        st.metric("Кешікті", late_tasks)
+    
+    # График
+    if len(tasks) > 0:
+        st.markdown("---")
+        st.subheader("📈 Статистикалық график")
+        
+        status_counts = {
+            'Орындалды': completed_tasks,
+            'Күтілуде': pending_tasks,
+            'Орындалуда': in_progress_tasks,
+            'Кешікті': late_tasks
+        }
+        
+        fig, ax = plt.subplots(figsize=(10, 5))
+        colors = ['#28a745', '#6c757d', '#ffc107', '#dc3545']
+        ax.bar(status_counts.keys(), status_counts.values(), color=colors)
+        ax.set_ylabel('Тапсырмалар саны')
+        ax.set_title('Тапсырмалардың статусы бойынша таралуы')
+        
+        for i, (status, count) in enumerate(status_counts.items()):
+            ax.text(i, count + 0.1, str(count), ha='center', va='bottom')
+        
+        st.pyplot(fig)
+
+# ============ СЫНЫПТАР БАСҚАРУ ============
+
+def show_classes_management():
+    """Сыныптарды басқару"""
+    t = texts[st.session_state.language]
+    
+    col1, col2 = st.columns([3, 1])
+    
+    with col1:
+        st.markdown(f"<h2>🏫 {t['classes']}</h2>", unsafe_allow_html=True)
+    
+    with col2:
+        if st.button(f"➕ {t['add_class']}", use_container_width=True):
+            st.session_state.show_add_class = True
+    
+    if st.session_state.get('show_add_class', False):
+        with st.form("add_class_form"):
+            st.subheader(f"➕ {t['add_class']}")
+            
+            name = st.text_input(f"🏫 {t['class_name']}")
+            subject = st.text_input(f"📚 {t['subject']}")
+            grade_level = st.selectbox("🎯 Сынып деңгейі", ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11"])
+            description = st.text_area(f"📄 {t['description']}")
+            
+            col_submit, col_cancel = st.columns(2)
+            
+            with col_submit:
+                if st.form_submit_button(f"✅ {t['add']}", use_container_width=True):
+                    if name and subject:
+                        if add_class(st.session_state.user[0], name, subject, grade_level, description):
+                            st.success(f"✅ '{name}' сыныбы сәтті қосылды!")
+                            st.session_state.show_add_class = False
+                            time.sleep(1)
+                            st.rerun()
+                        else:
+                            st.error("❌ Сыныпты қосу кезінде қате пайда болды")
+                    else:
+                        st.error("❌ Сынып атауы мен пәнді толтырыңыз!")
+            
+            with col_cancel:
+                if st.form_submit_button(f"❌ Болдырмау", use_container_width=True):
+                    st.session_state.show_add_class = False
+                    st.rerun()
+    
+    # Сыныптар тізімі
+    classes = get_classes(st.session_state.user[0])
+    
+    if not classes:
+        st.info(f"📭 {t['no_classes']}")
+        return
+    
+    for class_item in classes:
+        with st.expander(f"🏫 {class_item[1]} - {class_item[2]} (Сынып {class_item[3]})", expanded=False):
+            col_info, col_actions = st.columns([3, 1])
+            
+            with col_info:
+                st.markdown(f"**Пән:** {class_item[2]}")
+                st.markdown(f"**Сынып деңгейі:** {class_item[3]}")
+                if st.button(f"👨‍🎓 Оқушыларды басқару", key=f"manage_{class_item[0]}"):
+                    st.session_state.current_class_id = class_item[0]
+                    st.rerun()
+            
+            with col_actions:
+                if st.button("🗑️ Сыныпты жою", key=f"delete_{class_item[0]}"):
+                    st.session_state.class_to_delete = class_item[0]
+                    st.session_state.confirm_delete = True
+    
+    # Сыныпты жою растау
+    if st.session_state.get('confirm_delete', False) and st.session_state.class_to_delete:
+        st.warning(f"⚠️ {t['delete_warning']}")
+        col_confirm, col_cancel = st.columns(2)
+        
+        with col_confirm:
+            if st.button("✅ Иә, жою", use_container_width=True):
+                if delete_class(st.session_state.class_to_delete):
+                    st.success(f"✅ {t['class_deleted']}")
+                    st.session_state.class_to_delete = None
+                    st.session_state.confirm_delete = False
+                    time.sleep(1)
+                    st.rerun()
+                else:
+                    st.error("❌ Сыныпты жою кезінде қате пайда болды")
+        
+        with col_cancel:
+            if st.button("❌ Жоқ, болдырмау", use_container_width=True):
+                st.session_state.class_to_delete = None
+                st.session_state.confirm_delete = False
+                st.rerun()
+
+# ============ ОҚУШЫЛАР БАСҚАРУ ============
+
+def show_students_management():
+    """Оқушыларды басқару"""
+    t = texts[st.session_state.language]
+    
+    st.markdown(f"<h2>👨‍🎓 {t['students']}</h2>", unsafe_allow_html=True)
+    
+    # Сыныпты таңдау
+    classes = get_classes(st.session_state.user[0])
+    
+    if not classes:
+        st.info(f"📭 {t['no_classes']}")
+        return
+    
+    class_options = {f"{c[1]} (Сынып {c[3]})": c[0] for c in classes}
+    
+    if st.session_state.current_class_id:
+        current_class_id = st.session_state.current_class_id
+        # Тандалған сыныптың атауын табу
+        selected_class_name = ""
+        for c in classes:
+            if c[0] == current_class_id:
+                selected_class_name = f"{c[1]} (Сынып {c[3]})"
+                break
+    else:
+        selected_class_name = list(class_options.keys())[0]
+        current_class_id = class_options[selected_class_name]
+    
+    selected_class_name = st.selectbox(
+        f"🎯 {t['select_class']}",
+        list(class_options.keys()),
+        index=list(class_options.keys()).index(selected_class_name) if selected_class_name in class_options else 0
+    )
+    
+    current_class_id = class_options[selected_class_name]
+    st.session_state.current_class_id = current_class_id
+    
+    # Оқушыларды қосу формасы
+    with st.form("add_student_form"):
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            full_name = st.text_input(f"👤 {t['student_name']}")
+            student_code = st.text_input(f"🎯 {t['student_id']}")
+        
+        with col2:
+            grade_points = st.number_input(f"⭐ {t['points']}", min_value=0, max_value=10, value=5)
+            academic_performance = st.selectbox(
+                f"📊 {t['academic_performance']}",
+                ["Өте жақсы", "Жақсы", "Орташа", "Қанағаттанарлықсыз", "Әлсіз"]
+            )
+        
+        col_add, col_import = st.columns(2)
+        
+        with col_add:
+            submit_button = st.form_submit_button(f"➕ {t['add_student']}", use_container_width=True)
+            
+            if submit_button:
+                if full_name and student_code:
+                    try:
+                        if add_student(current_class_id, full_name, student_code, grade_points, academic_performance):
+                            st.success(f"✅ {t['student_added']}")
+                            time.sleep(1)
+                            st.rerun()
+                        else:
+                            st.error("❌ Оқушыны қосу кезінде қате пайда болды")
+                    except Exception as e:
+                        st.error(f"❌ Қате: {str(e)}")
+                else:
+                    st.error("❌ Оқушының аты мен кодын толтырыңыз!")
+    
+    # Оқушылар тізімі
+    students = get_students_by_class(current_class_id)
+    
+    if not students:
+        st.info(f"📭 {t['no_students']}")
+        return
+    
+    st.markdown(f"### 👨‍🎓 Оқушылар тізімі ({len(students)} адам)")
+    
+    for student in students:
+        # Оқушы ақпаратын тексеру (бағандар саны)
+        student_name = student[2] if len(student) > 2 else "Аты жоқ"
+        student_code = student[3] if len(student) > 3 else "Коды жоқ"
+        grade_points = student[4] if len(student) > 4 else 0
+        academic_performance = student[5] if len(student) > 5 else "Орташа"
+        
+        with st.expander(f"{student_name} ({student_code}) - {grade_points} балл", expanded=False):
+            col_info, col_login, col_delete = st.columns([3, 2, 1])
+            
+            with col_info:
+                st.markdown(f"**Код:** {student_code}")
+                st.markdown(f"**Баға:** {grade_points} балл")
+                st.markdown(f"**Оқу деңгейі:** {academic_performance}")
+            
+            with col_login:
+                # Оқушы логинін басқару
+                logins = get_student_logins(student[0])
+                
+                if not logins:
+                    if st.button("🔐 Логин құру", key=f"create_login_{student[0]}"):
+                        st.session_state[f"show_login_form_{student[0]}"] = True
+                    
+                    if st.session_state.get(f"show_login_form_{student[0]}", False):
+                        with st.form(f"login_form_{student[0]}"):
+                            username = st.text_input("Логин", value=f"student_{student_code}")
+                            password = st.text_input("Құпия сөз", type="password", value=generate_random_password())
+                            
+                            col_save, col_cancel = st.columns(2)
+                            
+                            with col_save:
+                                if st.form_submit_button("✅ Сақтау"):
+                                    success, message = register_student_login(student[0], username, password)
+                                    if success:
+                                        st.success(f"✅ {message}")
+                                        st.session_state[f"show_login_form_{student[0]}"] = False
+                                        time.sleep(1)
+                                        st.rerun()
+                                    else:
+                                        st.error(f"❌ {message}")
+                            
+                            with col_cancel:
+                                if st.form_submit_button("❌ Болдырмау"):
+                                    st.session_state[f"show_login_form_{student[0]}"] = False
+                                    st.rerun()
+                else:
+                    for login in logins:
+                        st.markdown(f"**Логин:** {login[1]}")
+                        
+                        if st.button("🔄 Құпия сөзді өзгерту", key=f"change_pass_{login[0]}"):
+                            st.session_state[f"show_change_pass_{login[0]}"] = True
+                        
+                        if st.session_state.get(f"show_change_pass_{login[0]}", False):
+                            new_password = st.text_input("Жаңа құпия сөз", type="password", key=f"new_pass_{login[0]}")
+                            
+                            if st.button("✅ Сақтау", key=f"save_pass_{login[0]}"):
+                                if update_student_password(login[0], new_password):
+                                    st.success("✅ Құпия сөз сәтті өзгертілді!")
+                                    st.session_state[f"show_change_pass_{login[0]}"] = False
+                                    time.sleep(1)
+                                    st.rerun()
+                                else:
+                                    st.error("❌ Құпия сөзді өзгерту кезінде қате пайда болды")
+                        
+                        if st.button("🗑️ Логинды жою", key=f"delete_login_{login[0]}"):
+                            if delete_student_login(login[0]):
+                                st.success("✅ Логин жойылды!")
+                                time.sleep(1)
+                                st.rerun()
+                            else:
+                                st.error("❌ Логинды жою кезінде қате пайда болды")
+            
+            with col_delete:
+                if st.button("🗑️", key=f"delete_{student[0]}"):
+                    if delete_student(student[0]):
+                        st.success("✅ Оқушы жойылды!")
+                        time.sleep(1)
+                        st.rerun()
+                    else:
+                        st.error("❌ Оқушыны жою кезінде қате пайда болды")
+
+# ============ БАСҚА БӨЛІМДЕР ============
+
+def show_student_performance():
+    """Оқушылардың үлгерімін көрсету"""
+    t = texts[st.session_state.language]
+    st.markdown(f"<h2>📊 {t['student_performance']}</h2>", unsafe_allow_html=True)
+    
+    classes = get_classes(st.session_state.user[0])
+    if not classes:
+        st.info("📭 Сізде әлі сыныптар жоқ")
+        return
+    
+    all_students = []
+    for class_item in classes:
+        students = get_students_by_class(class_item[0])
+        for student in students:
+            # points мәнін санға түрлендіру
+            try:
+                grade_points = student[4] if len(student) > 4 else 0
+                points_value = int(grade_points) if grade_points is not None else 0
+            except (ValueError, TypeError):
+                points_value = 0
+            
+            academic_performance = student[5] if len(student) > 5 else "Орташа"
+            
+            all_students.append({
+                'class': class_item[1],
+                'name': student[2] if len(student) > 2 else "Аты жоқ",
+                'code': student[3] if len(student) > 3 else "Коды жоқ",
+                'points': points_value,
+                'performance': academic_performance,
+                'grade': points_to_grade(points_value)
+            })
+    
+    if not all_students:
+        st.info("📭 Оқушылар жоқ")
+        return
+    
+    df = pd.DataFrame(all_students)
+    
+    # points бағанының түрін тексеру және түрлендіру
+    if df['points'].dtype == 'object':
+        # Егер жол болса, санға түрлендіру
+        df['points'] = pd.to_numeric(df['points'], errors='coerce').fillna(0)
+    
+    # Статистика
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Барлық оқушылар", len(df))
+    with col2:
+        avg_points = df['points'].mean()
+        st.metric("Орташа балл", f"{avg_points:.1f}")
+    with col3:
+        excellent = len(df[df['grade'] == 'A'])
+        st.metric("Өте жақсы (A)", excellent)
+    with col4:
+        weak = len(df[df['grade'] == 'F'])
+        st.metric("Әлсіз (F)", weak)
+    
+    # Кесте - мәндерді түрлендіруді қайта жасау
+    display_df = df.copy()
+    display_df['points'] = display_df['points'].astype(str) + ' балл'  # Көрсету үшін
+    st.dataframe(display_df, use_container_width=True)
+    
+    # График
+    if len(df) > 0:
+        fig, ax = plt.subplots(1, 2, figsize=(12, 5))
+        
+        # Бағалар таралуы
+        grade_counts = df['grade'].value_counts().sort_index()
+        colors = ['#28a745', '#ffc107', '#fd7e14', '#dc3545', '#6c757d']
+        ax[0].bar(grade_counts.index, grade_counts.values, color=colors[:len(grade_counts)])
+        ax[0].set_title('Бағалардың таралуы')
+        ax[0].set_xlabel('Баға')
+        ax[0].set_ylabel('Оқушылар саны')
+        
+        # Сыныптар бойынша орташа балл
+        class_avg = df.groupby('class')['points'].mean()
+        ax[1].bar(class_avg.index, class_avg.values)
+        ax[1].set_title('Сыныптар бойынша орташа балл')
+        ax[1].set_xlabel('Сынып')
+        ax[1].set_ylabel('Орташа балл')
+        ax[1].tick_params(axis='x', rotation=45)
+        
+        st.pyplot(fig)
+
+def show_bzb_tasks():
+    """БЖБ тапсырмаларын көрсету"""
+    t = texts[st.session_state.language]
+    st.markdown(f"<h2>📝 {t['bzb_tasks']}</h2>", unsafe_allow_html=True)
+    
+    # Тапсырма қосу формасы
+    with st.form("add_bzb_task"):
+        st.subheader("📤 Жаңа БЖБ тапсырмасын қосу")
+        
+        classes = get_classes(st.session_state.user[0])
+        if not classes:
+            st.info("Алдымен сынып қосыңыз.")
+            return
+        
+        class_options = {f"{c[1]} (Сынып {c[3]})": c[0] for c in classes}
+        selected_class = st.selectbox("🎯 Сыныпты таңдаңыз", list(class_options.keys()))
+        class_id = class_options[selected_class]
+        
+        task_name = st.text_input("📝 Тапсырма атауы")
+        task_file = st.file_uploader("📁 Файл жүктеу", type=['pdf', 'doc', 'docx', 'txt', 'xlsx'])
+        completion_rate = st.slider("✅ Орындалу деңгейі (%)", 0, 100, 50)
+        difficulty_level = st.selectbox("⚡ Қиындық деңгейі", ["Оңай", "Орташа", "Қиын"])
+        
+        if st.form_submit_button("📤 Тапсырманы жүктеу", use_container_width=True):
+            if task_name and task_file:
+                if save_bzb_task(st.session_state.user[0], class_id, task_name, task_file, 
+                               task_file.type, completion_rate, difficulty_level):
+                    st.success("✅ БЖБ тапсырмасы сәтті жүктелді!")
+                    time.sleep(1)
+                    st.rerun()
+                else:
+                    st.error("❌ Тапсырманы жүктеу кезінде қате пайда болды")
+            else:
+                st.error("❌ Тапсырма атауы мен файлын толтырыңыз!")
+    
+    # Тапсырмалар тізімі
+    st.markdown("---")
+    st.subheader("📋 БЖБ тапсырмалары тізімі")
+    
+    tasks = get_bzb_tasks(st.session_state.user[0])
+    
+    if not tasks:
+        st.info("📭 БЖБ тапсырмалары жоқ")
+        return
+    
+    for task in tasks:
+        with st.expander(f"📝 {task['name']} - {task['class_name']}", expanded=False):
+            col1, col2 = st.columns([3, 1])
+            
+            with col1:
+                st.markdown(f"**Сынып:** {task['class_name']}")
+                st.markdown(f"**Жүктелген күні:** {task['uploaded']}")
+                st.markdown(f"**Орындалу деңгейі:** {task['rate']}%")
+                st.markdown(f"**Қиындық деңгейі:** {task['difficulty']}")
+                
+                if task['ai_solution']:
+                    with st.expander("🤖 AI шешімі", expanded=False):
+                        st.info(task['ai_solution'])
+            
+            with col2:
+                if st.button("👁️ Алдын ала қарау", key=f"preview_{task['id']}"):
+                    st.session_state.preview_file = {'id': task['id'], 'type': 'bzb', 'name': task['name']}
+                    st.rerun()
+                
+                task_data = get_bzb_task(task['id'])
+                if task_data:
+                    file_extension = get_file_extension(task_data['type'])
+                    st.download_button(
+                        label="📥 Жүктеп алу",
+                        data=task_data['data'],
+                        file_name=f"{task_data['name']}.{file_extension}",
+                        mime=task_data['type'],
+                        key=f"download_{task['id']}"
+                    )
+
+def show_visual_materials():
+    """Көрнекілік материалдарды көрсету"""
+    t = texts[st.session_state.language]
+    st.markdown(f"<h2>📁 {t['visual_materials']}</h2>", unsafe_allow_html=True)
+    
+    # Материал жүктеу формасы
+    with st.form("upload_material"):
+        st.subheader("📤 Жаңа материал жүктеу")
+        
+        file = st.file_uploader("📁 Файлды таңдаңыз", 
+                               type=['pdf', 'doc', 'docx', 'txt', 'pptx', 'jpg', 'png', 'mp4', 'mp3'])
+        category = st.selectbox("📂 Санат", 
+                              ["Презентация", "Есептер жинағы", "Тесттер", "Үй тапсырмасы", "Басқа"])
+        
+        if st.form_submit_button("📤 Жүктеу", use_container_width=True):
+            if file:
+                if save_file_to_db(st.session_state.user[0], file.name, file, category):
+                    st.success(f"✅ '{file.name}' файлы сәтті жүктелді!")
+                    time.sleep(1)
+                    st.rerun()
+                else:
+                    st.error("❌ Файлды жүктеу кезінде қате пайда болды")
+            else:
+                st.error("❌ Файлды таңдаңыз!")
+    
+    # Материалдар тізімі
+    st.markdown("---")
+    st.subheader("📋 Материалдар тізімі")
+    
+    files = get_saved_files(st.session_state.user[0])
+    
+    if not files:
+        st.info("📭 Жүктелген материалдар жоқ")
+        return
+    
+    for file in files:
+        with st.expander(f"📁 {file['name']} ({file['category']})", expanded=False):
+            col1, col2, col3 = st.columns([3, 1, 1])
+            
+            with col1:
+                st.markdown(f"**Саны:** {file['category']}")
+                st.markdown(f"**Өлшемі:** {file['size']}")
+                st.markdown(f"**Жүктелген күні:** {file['uploaded']}")
+            
+            with col2:
+                if st.button("👁️ Алдын ала қарау", key=f"preview_{file['id']}"):
+                    st.session_state.preview_file = {'id': file['id'], 'type': 'visual', 'name': file['name']}
+                    st.rerun()
+            
+            with col3:
+                if st.button("🗑️ Жою", key=f"delete_{file['id']}"):
+                    if delete_file(file['id']):
+                        st.success("✅ Файл жойылды!")
+                        time.sleep(1)
+                        st.rerun()
+                    else:
+                        st.error("❌ Файлды жою кезінде қате пайда болды")
+
+def show_ai_tools():
+    """AI құралдарын көрсету"""
+    t = texts[st.session_state.language]
+    st.markdown(f"<h2>🤖 {t['ai_tools']}</h2>", unsafe_allow_html=True)
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        if st.button("📝 AI сабақ жоспары", use_container_width=True):
+            st.session_state.ai_tool_page = "lesson_plan"
+            st.rerun()
+        
+        if st.button("👨‍🎓 Оқушы талдауы", use_container_width=True):
+            st.session_state.ai_tool_page = "student_analysis"
+            st.rerun()
+        
+        if st.button("🎯 Тапсырма генераторы", use_container_width=True):
+            st.session_state.ai_tool_page = "task_generator"
+            st.rerun()
+    
+    with col2:
+        if st.button("📊 Бағалау критерийлері", use_container_width=True):
+            st.session_state.ai_tool_page = "assessment_rubric"
+            st.rerun()
+        
+        if st.button("🔮 Прогноздық талдау", use_container_width=True):
+            st.session_state.ai_tool_page = "predictive_analysis"
+            st.rerun()
+        
+        if st.button("💡 Педагогикалық кеңестер", use_container_width=True):
+            st.session_state.ai_tool_page = "teaching_advice"
+            st.rerun()
+    
+    st.markdown("---")
+    
+    if st.button("🤖 AI көмекші", use_container_width=True):
+        st.session_state.ai_tool_page = "ai_assistant"
+        st.rerun()
+
+def show_file_preview():
+    """Файлды алдын ала қарау"""
+    file_info = st.session_state.preview_file
+    
+    st.markdown(f"<h2>👁️ {file_info['name']} файлын алдын ала қарау</h2>", unsafe_allow_html=True)
+    
+    col1, col2 = st.columns([3, 1])
+    
+    with col1:
+        if file_info['type'] == 'bzb':
+            task = get_bzb_task(file_info['id'])
+            if task:
+                preview_file(task['data'], task['type'], task['name'])
+                if task.get('ai_solution'):
+                    with st.expander("🤖 AI шешімі", expanded=True):
+                        st.info(task['ai_solution'])
+        elif file_info['type'] == 'visual':
+            file = get_visual_material(file_info['id'])
+            if file:
+                preview_file(file['data'], file['type'], file['name'])
+    
+    with col2:
+        st.markdown("---")
+        if st.button("❌ Алдын ала қарауды жабу", use_container_width=True):
+            st.session_state.preview_file = None
+            st.rerun()
+        
+        st.markdown("---")
+        st.markdown("### 📥 Файлды жүктеп алу")
+        
+        if file_info['type'] == 'bzb':
+            task = get_bzb_task(file_info['id'])
+            if task:
+                file_extension = get_file_extension(task['type'])
+                st.download_button(
+                    label="📥 Жүктеп алу",
+                    data=task['data'],
+                    file_name=f"{task['name']}.{file_extension}",
+                    mime=task['type'],
+                    use_container_width=True
+                )
+        elif file_info['type'] == 'visual':
+            file = get_visual_material(file_info['id'])
+            if file:
+                file_extension = get_file_extension(file['type'])
+                st.download_button(
+                    label="📥 Жүктеп алу",
+                    data=file['data'],
+                    file_name=f"{file['name']}.{file_extension}",
+                    mime=file['type'],
+                    use_container_width=True
+                )
+
+# ============ AI ҚҰРАЛДАРЫ ============
+
+def show_ai_lesson_plan():
+    """AI сабақ жоспары"""
+    t = texts[st.session_state.language]
+    
+    st.markdown(f"<h2>🤖 AI сабақ жоспары</h2>", unsafe_allow_html=True)
+    
+    if st.button(f"⬅️ {t['back']}", type="secondary"):
+        st.session_state.ai_tool_page = None
+        st.rerun()
+    
+    with st.form("lesson_plan_form"):
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            subject = st.text_input("📚 Пән", placeholder="Математика")
+            grade_level = st.selectbox("🎯 Сынып", ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11"])
+            lesson_name = st.text_input("📝 Сабақ тақырыбы", placeholder="Бөлшектермен амалдар")
+        
+        with col2:
+            lesson_type = st.selectbox("🔧 Сабақ түрі", ["Жаңа білім", "Бекіту", "Қорытынды", "Бақылау"])
+            duration = st.number_input("⏰ Уақыт (минут)", min_value=20, max_value=120, value=40)
+        
+        goals = st.text_area("🎯 Мақсаттар", placeholder="Сабақтың мақсаттары...")
+        equipment = st.text_input("🛠️ Құрал-жабдықтар", placeholder="Оқулық, слайдтар, тақта...")
+        
+        if st.form_submit_button(f"🚀 {t['generate']}", use_container_width=True):
+            # AI генерациясы (симуляция)
+            ai_response = f"""
+            🤖 AI сабақ жоспары:
+            
+            **Сабақ атауы:** {lesson_name}
+            **Пән:** {subject}
+            **Сынып:** {grade_level}
+            **Сабақ түрі:** {lesson_type}
+            **Ұзақтығы:** {duration} минут
+            
+            **Мақсаттар:**
+            • {goals if goals else "Білімділік, дамытушылық, тәрбиелік мақсаттар"}
+            
+            **Құрал-жабдықтар:** {equipment}
+            
+            **Сабақ барысы:**
+            1. Ұйымдастыру кезеңі (5 минут)
+            2. Жаңа тақырыпты түсіндіру (15 минут)
+            3. Практикалық жұмыс (15 минут)
+            4. Қорытындылау (5 минут)
+            
+            **Үй тапсырмасы:**
+            • Оқулықтан есептер шығару
+            • Тақырыпты қайталау
+            
+            **Бағалау критерийлері:**
+            • Өз бетінше жұмыс жасау - 30%
+            • Жауаптардың дұрыстығы - 40%
+            • Жұмыстың тазалығы - 30%
+            """
+            
+            st.success("✅ AI сабақ жоспары жасалды!")
+            st.markdown(ai_response)
+
+def show_student_analysis():
+    """Оқушы талдауы"""
+    t = texts[st.session_state.language]
+    
+    st.markdown(f"<h2>👨‍🎓 Оқушы талдауы</h2>", unsafe_allow_html=True)
+    
+    if st.button(f"⬅️ {t['back']}", type="secondary"):
+        st.session_state.ai_tool_page = None
+        st.rerun()
+    
+    # Сыныптар мен оқушыларды таңдау
+    classes = get_classes(st.session_state.user[0])
+    if not classes:
+        st.info("📭 Сізде әлі сыныптар жоқ")
+        return
+    
+    class_options = {f"{c[1]} (Сынып {c[3]})": c[0] for c in classes}
+    selected_class_name = st.selectbox("🎯 Сыныпты таңдаңыз", list(class_options.keys()))
+    class_id = class_options[selected_class_name]
+    
+    students = get_students_by_class(class_id)
+    if not students:
+        st.info("📭 Бұл сыныпта оқушылар жоқ")
+        return
+    
+    student_options = {f"{s[2] if len(s) > 2 else 'Аты жоқ'} ({s[3] if len(s) > 3 else 'Коды жоқ'})": s[0] for s in students}
+    selected_student_name = st.selectbox("👨‍🎓 Оқушыны таңдаңыз", list(student_options.keys()))
+    student_id = student_options[selected_student_name]
+    
+    # Оқушы мәліметтерін табу
+    selected_student = None
+    for student in students:
+        if student[0] == student_id:
+            selected_student = student
+            break
+    
+    if selected_student:
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            grade_points = selected_student[4] if len(selected_student) > 4 else 0
+            st.metric("Баға", f"{grade_points} балл")
+        
+        with col2:
+            grade_letter = points_to_grade(grade_points)
+            st.metric("Әріптік баға", grade_letter)
+        
+        with col3:
+            academic_performance = selected_student[5] if len(selected_student) > 5 else "Орташа"
+            st.metric("Оқу деңгейі", academic_performance)
+    
+    if st.button(f"🔍 {t['analyze']}", use_container_width=True):
+        # AI талдауы (симуляция)
+        student_name = selected_student[2] if len(selected_student) > 2 else "Аты жоқ"
+        student_code = selected_student[3] if len(selected_student) > 3 else "Коды жоқ"
+        grade_points = selected_student[4] if len(selected_student) > 4 else 0
+        academic_performance = selected_student[5] if len(selected_student) > 5 else "Орташа"
+        
+        ai_analysis = f"""
+        🤖 AI оқушы талдауы:
+        
+        **Оқушы:** {student_name}
+        **Код:** {student_code}
+        **Ағымдағы баға:** {grade_points} балл ({points_to_grade(grade_points)})
+        **Оқу деңгейі:** {academic_performance}
+        
+        **Талдау нәтижелері:**
+        • Күшті жақтары: Математикалық логика, есептер шығару
+        • Әлсіз жақтары: Теорияны жаттау, ұзақ мәтінді талдау
+        • Қызығушылық салалары: Технологиялар, практикалық жұмыстар
+        
+        **Ұсыныстар:**
+        1. Практикалық тапсырмаларды көбейту
+        2. Ойын форматындағы тесттер қолдану
+        3. Жеке жұмыс үшін қосымша материалдар беру
+        
+        **Болжам:**
+        • Келесі тоқсанда бағасы: {min(10, grade_points + 1)} балл
+        • Әріптік баға: {points_to_grade(min(10, grade_points + 1))}
+        • Қауіп факторлары: Жаттығу санының жетіспеушілігі
+        """
+        
+        st.success("✅ AI талдауы аяқталды!")
+        st.markdown(ai_analysis)
+
+# ... (show_task_generator, show_assessment_rubric, show_predictive_analysis, 
+# show_teaching_advice, show_ai_assistant функциялары ұқсас болғандықтан қысқартылды) ...
+
+# ============ ОҚУШЫ ПОРТАЛЫ ============
+
+def show_student_portal():
+    """Оқушы порталы"""
+    t = texts[st.session_state.language]
+    
+    if 'student' not in st.session_state:
+        show_student_login()
+        return
+    
+    with st.sidebar:
+        st.markdown(f"""
+        <div style='background: linear-gradient(135deg, #0066CC, #CC0000); 
+                    padding: 1.5rem; border-radius: 10px; color: white;'>
+            <h2 style='margin: 0; text-align: center;'>🎒 ОҚУШЫ ПОРТАЛЫ</h2>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        student_info = st.session_state.student
+        st.markdown(f"""
+        <div class='teacher-card'>
+            <h4>👨‍🎓 {student_info[1]}</h4>
+            <p>📚 {student_info[5]} - {student_info[4]}</p>
+            <p>🎯 Код: {student_info[2]}</p>
+            <p>⭐ Баға: {student_info[6]} балл</p>
+            <p>📊 Деңгей: {student_info[7]}</p>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        st.markdown("---")
+        
+        menu_options = ["📝 Менің тапсырмаларым", "📊 Менің үлгерімім", "📚 Оқу материалдары", "🚪 Шығу"]
+        selected_menu = st.radio("📋 Бөлімдер", menu_options)
+        
+        st.markdown("---")
+        
+        if selected_menu == "🚪 Шығу":
+            if st.button("🚪 Шығу", use_container_width=True, type="primary"):
+                clear_student_session()
+                st.session_state.student = None
+                st.rerun()
+    
+    if selected_menu == "📝 Менің тапсырмаларым":
+        show_student_my_tasks()
+    elif selected_menu == "📊 Менің үлгерімім":
+        show_student_my_performance()
+    elif selected_menu == "📚 Оқу материалдары":
+        show_student_materials()
+
+def show_student_login():
+    """Оқушы кіру беті"""
+    t = texts[st.session_state.language]
+    
+    st.markdown(f"""
+    <div style='background: linear-gradient(135deg, #0066CC, #CC0000); 
+                padding: 2rem; border-radius: 10px; color: white; margin-bottom: 20px;'>
+        <h1 style='margin: 0; text-align: center;'>🎒 ОҚУШЫ ПОРТАЛЫ</h1>
+        <p style='margin: 0; text-align: center; font-size: 1.2rem;'>AI QAZAQ Teachers</p>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    with st.form("student_login_form"):
+        st.subheader("🔐 Оқушы кіруі")
+        
+        username = st.text_input("👤 Логин", placeholder="student_2024001")
+        password = st.text_input("🔒 Құпия сөз", type="password")
+        
+        if st.form_submit_button("✅ Кіру", use_container_width=True):
+            student = student_login(username, password)
+            if student:
+                st.session_state.student = student
+                save_student_session(student)
+                st.success(f"🎉 Қош келдіңіз, {student[1]}!")
+                time.sleep(1)
+                st.rerun()
+            else:
+                st.error("❌ Қате логин немесе құпия сөз!")
+
+def show_student_my_tasks():
+    """Оқушының тапсырмалары"""
+    t = texts[st.session_state.language]
+    
+    st.markdown(f"<h2>📝 Менің тапсырмаларым</h2>", unsafe_allow_html=True)
+    
+    student_id = st.session_state.student[0]
+    tasks = get_student_tasks_by_student(student_id)
+    
+    if not tasks:
+        st.info("📭 Сізге тапсырмалар әлі жіберілмеген")
+        return
+    
+    # Тапсырмаларды көрсету
+    for task in tasks:
+        # Статус бойынша түс
+        status_colors = {
+            "Жіберілмеді": "#6c757d",
+            "Орындалды": "#28a745",
+            "Кешікті": "#dc3545",
+            "Орындалуда": "#ffc107"
+        }
+        status_color = status_colors.get(task['status'], "#6c757d")
+        
+        with st.expander(
+            f"{task['task_name']} - {task['teacher_name']} ({task['class_name']})"
+        ):
+            col_info1, col_info2 = st.columns(2)
+            
+            with col_info1:
+                st.markdown(f"**Мұғалім:** {task['teacher_name']}")
+                st.markdown(f"**Сынып:** {task['class_name']}")
+                st.markdown(f"**Мерзімі:** {task['due_date']}")
+            
+            with col_info2:
+                st.markdown(f"**Балл:** {task['points']}")
+                st.markdown(f"**Жіберілген күні:** {task['assigned_date']}")
+                st.markdown(f"""
+                <div style='background-color: {status_color}; color: white; 
+                            padding: 10px; border-radius: 5px; text-align: center;'>
+                    <strong>Статус:</strong> {task['status']}
+                </div>
+                """, unsafe_allow_html=True)
+            
+            if task['description']:
+                st.markdown("**Сипаттама:**")
+                st.info(task['description'])
+            
+            if task['feedback']:
+                st.markdown("**Мұғалімнің кері байланысы:**")
+                st.success(task['feedback'])
+            
+            # Файлды жүктеп алу
+            task_file = get_student_task_file(task['id'])
+            if task_file and task_file['data']:
+                st.markdown("---")
+                st.subheader("📄 Тапсырма файлы")
+                
+                col_file1, col_file2 = st.columns([2, 1])
+                
+                with col_file1:
+                    file_extension = get_file_extension(task_file['type'])
+                    st.info(f"Файл түрі: {task_file['type']}")
+                    st.info(f"Файл атауы: {task_file['name']}")
+                
+                with col_file2:
+                    st.download_button(
+                        label="📥 Файлды жүктеп алу",
+                        data=task_file['data'],
+                        file_name=f"{task_file['name']}.{file_extension}",
+                        mime=task_file['type'],
+                        key=f"student_download_{task['id']}"
+                    )
+            
+            # Жауап жіберу (егер орындалмаса)
+            if task['status'] != 'Орындалды':
+                st.markdown("---")
+                st.subheader("📤 Жауап жіберу")
+                
+                with st.form(f"submit_answer_{task['id']}"):
+                    answer_text = st.text_area(f"📝 {t['answer_text']}:", height=150, 
+                                              placeholder="Жауабыңызды осы жерге жазыңыз...")
+                    answer_file = st.file_uploader(f"📁 {t['answer_file']}:", 
+                                                  type=['pdf', 'doc', 'docx', 'txt', 'jpg', 'png', 'zip'])
+                    
+                    col_submit1, col_submit2 = st.columns([1, 2])
+                    with col_submit1:
+                        if st.form_submit_button(f
